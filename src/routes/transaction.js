@@ -74,17 +74,40 @@ transactionRouter.post('/transaction', userAuth, async (req, res) => {
     const createdTransactions = [];
 
     for (const transactionData of transactions) {
-      const { amount, date, description, categoryId, type, spendingType } =
-        transactionData;
+      const {
+        amount,
+        date,
+        description,
+        categoryId,
+        type,
+        spendingType,
+        recurring = false,
+        recurringFrequency,
+        recurringStartDate,
+        recurringEndDate,
+        nextOccurrence
+      } = transactionData;
 
-      if (!amount || !date || !categoryId || !type || !spendingType) {
-        return res
-          .status(400)
-          .json({ message: 'All fields are required for each transaction.' });
+      if (
+        !amount ||
+        !date ||
+        !categoryId ||
+        !type ||
+        (type === 'expense' && !spendingType)
+      ) {
+        return res.status(400).json({
+          message: 'All required fields are not provided for each transaction.'
+        });
       }
 
-      let category = null;
+      if (recurring && !recurringFrequency) {
+        return res.status(400).json({
+          message: 'Recurring frequency is required for recurring transactions.'
+        });
+      }
 
+      // ✅ Resolve category
+      let category = null;
       if (isValidObjectId(categoryId)) {
         const existingCategory = await Category.findById(categoryId);
         if (!existingCategory) {
@@ -97,26 +120,72 @@ transactionRouter.post('/transaction', userAuth, async (req, res) => {
         let existingCategoryByName = await Category.findOne({
           name: categoryId
         });
-
         if (!existingCategoryByName) {
           const newCategory = new Category({ name: categoryId, user: userId });
           existingCategoryByName = await newCategory.save();
         }
-        category = existingCategoryByName._id; // Assign the found or newly created category's ID
+        category = existingCategoryByName._id;
       }
 
-      // Create the transaction
-      const transaction = await Transaction.create({
-        amount,
-        date,
-        description,
-        type,
-        category,
-        user: userId,
-        spendingType
-      });
+      // ✅ If recurring and both dates are provided — generate immediately
+      if (recurring && recurringStartDate && recurringEndDate) {
+        const generatedDates = [];
+        let next = new Date(recurringStartDate);
+        const end = new Date(recurringEndDate);
+        end.setHours(0, 0, 0, 0);
 
-      createdTransactions.push(transaction);
+        while (next <= end) {
+          generatedDates.push(new Date(next));
+
+          switch (recurringFrequency) {
+            case 'daily':
+              next.setDate(next.getDate() + 1);
+              break;
+            case 'weekly':
+              next.setDate(next.getDate() + 7);
+              break;
+            case 'monthly':
+              next.setMonth(next.getMonth() + 1);
+              break;
+            case 'yearly':
+              next.setFullYear(next.getFullYear() + 1);
+              break;
+          }
+        }
+
+        const batch = await Transaction.insertMany(
+          generatedDates.map((date) => ({
+            amount,
+            date,
+            description,
+            type,
+            category,
+            user: userId,
+            spendingType,
+            recurring: false // These are one-time entries created in advance
+          }))
+        );
+
+        createdTransactions.push(...batch);
+      } else {
+        // ✅ Regular single transaction (cron will handle recurring if needed)
+        const transaction = await Transaction.create({
+          amount,
+          date,
+          description,
+          type,
+          category,
+          user: userId,
+          spendingType,
+          recurring,
+          recurringFrequency,
+          recurringStartDate,
+          recurringEndDate,
+          nextOccurrence
+        });
+
+        createdTransactions.push(transaction);
+      }
     }
 
     return res.status(201).json({
@@ -224,60 +293,115 @@ transactionRouter.get('/transaction/expense', userAuth, async (req, res) => {
 
 transactionRouter.put('/transaction/:id', userAuth, async (req, res) => {
   try {
+    // ✅ Step 1: Authenticate user
     const userId = req.user._id;
-    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized access' });
+    }
 
+    // ✅ Step 2: Extract params & request body
     const transactionId = req.params.id;
-    const { amount, category, description, date, type } = req.body;
+    const {
+      amount,
+      category,
+      description,
+      date,
+      type,
+      spendingType,
+      recurring,
+      recurringFrequency,
+      recurringStartDate,
+      recurringEndDate,
+      nextOccurrence
+    } = req.body;
 
+    // ✅ Step 3: Basic validation for required fields
     if (!amount || !category || !date || !type) {
       return res.status(400).json({
-        message: 'All fields (amount, category, date, type) are required.'
+        message: 'Missing required fields: amount, category, date, or type.'
       });
     }
+
+    // ✅ Step 4: If recurring is true, ensure frequency is present
+    if (recurring === true && !recurringFrequency) {
+      return res.status(400).json({
+        message: 'Recurring frequency is required when recurring is enabled.'
+      });
+    }
+
+    // ✅ Step 5: Normalize/resolve category
     let categoryId = null;
     if (isValidObjectId(category)) {
       const existingCategory = await Category.findById(category);
       if (!existingCategory) {
         return res.status(400).json({ message: 'Invalid category ID.' });
       }
-      console.log('existingCategory', existingCategory);
-
       categoryId = category;
     } else {
       const existingCategoryByName = await Category.findOne({ name: category });
       if (!existingCategoryByName) {
         return res.status(400).json({
           message:
-            'Category not found. Please provide a valid category ID or name.'
+            'Category not found. Please provide a valid category ID or existing category name.'
         });
       }
-      console.log('existingCategoryByName', existingCategoryByName);
-
-      categoryId = existingCategoryByName._id; // Assign the found category's ID
+      categoryId = existingCategoryByName._id;
     }
 
-    // Find and update the transaction
+    // ✅ Step 6: Prepare fields to update
+    const updateFields = {
+      amount,
+      category: categoryId,
+      description,
+      date,
+      type,
+      spendingType,
+      recurring
+    };
+
+    // ✅ Step 7: Add/remove recurring-related fields
+    if (recurring === true) {
+      if (recurringFrequency)
+        updateFields.recurringFrequency = recurringFrequency;
+      if (recurringStartDate)
+        updateFields.recurringStartDate = recurringStartDate;
+      if (recurringEndDate) updateFields.recurringEndDate = recurringEndDate;
+      if (nextOccurrence) updateFields.nextOccurrence = nextOccurrence;
+    } else {
+      // Clear all recurring fields if not recurring
+      updateFields.recurringFrequency = null;
+      updateFields.recurringStartDate = null;
+      updateFields.recurringEndDate = null;
+      updateFields.nextOccurrence = null;
+    }
+
+    // ✅ Step 8: Update transaction in DB
     const updatedTransaction = await Transaction.findOneAndUpdate(
-      { _id: transactionId, user: userId }, // Ensure the transaction belongs to the user
-      { amount, category: categoryId, description, date, type },
+      { _id: transactionId, user: userId },
+      updateFields,
       { new: true }
     );
 
     if (!updatedTransaction) {
-      return res
-        .status(404)
-        .json({ message: 'Transaction not found or unauthorized!' });
+      return res.status(404).json({
+        message: 'Transaction not found or does not belong to the user.'
+      });
     }
 
+    // ✅ Step 9: Respond with success
     return res.status(200).json({
-      message: 'Transaction updated!',
+      message: 'Transaction updated successfully.',
       transaction: updatedTransaction
     });
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    console.error('Error updating transaction:', error);
+    return res.status(500).json({
+      message: 'Something went wrong while updating the transaction.',
+      error: error.message
+    });
   }
 });
+
 transactionRouter.delete('/transaction/:id', userAuth, async (req, res) => {
   try {
     const transactionId = req.params.id;
@@ -558,7 +682,7 @@ transactionRouter.get(
         .populate('category', 'name')
         .sort({ date: -1 })
         .limit(3)
-        .select('amount date description category type');
+        .select('amount date description category type recurring');
 
       return res.status(200).json({ recentIncome });
     } catch (error) {
@@ -584,7 +708,7 @@ transactionRouter.get(
         .populate('category', 'name')
         .sort({ date: -1 })
         .limit(3)
-        .select('amount date description category type spendingType');
+        .select('amount date description category type spendingType recurring');
 
       return res.status(200).json({ recentExpenses });
     } catch (error) {
