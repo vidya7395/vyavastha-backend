@@ -9,14 +9,11 @@ cron.schedule('0 0 * * *', async () => {
   today.setHours(0, 0, 0, 0);
 
   try {
-    // ✅ Find all recurring transactions due today or earlier
+    // ✅ Only process open-ended recurring transactions
     const recurringTransactions = await Transaction.find({
       recurring: true,
       nextOccurrence: { $lte: today },
-      $or: [
-        { recurringEndDate: { $exists: false } },
-        { recurringEndDate: { $gte: today } }
-      ]
+      recurringEndDate: { $exists: false } // 🔐 Prevent picking pre-generated recurrences
     });
 
     if (!recurringTransactions.length) {
@@ -27,7 +24,7 @@ cron.schedule('0 0 * * *', async () => {
     let processedCount = 0;
 
     for (const txn of recurringTransactions) {
-      // ✅ 1. Create a new one-time copy
+      // ✅ 1. Create a one-time transaction copy
       await Transaction.create({
         amount: txn.amount,
         date: txn.nextOccurrence,
@@ -39,7 +36,7 @@ cron.schedule('0 0 * * *', async () => {
         recurring: false
       });
 
-      // ✅ 2. Calculate the next occurrence
+      // ✅ 2. Calculate nextOccurrence
       const next = new Date(txn.nextOccurrence);
 
       switch (txn.recurringFrequency) {
@@ -59,7 +56,7 @@ cron.schedule('0 0 * * *', async () => {
           console.warn(
             `⚠️ Unknown frequency "${txn.recurringFrequency}" for transaction ${txn._id}`
           );
-          continue; // Skip this txn
+          continue; // Skip invalid frequency
       }
 
       // ✅ 3. Save updated nextOccurrence

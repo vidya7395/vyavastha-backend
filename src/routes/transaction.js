@@ -3,6 +3,7 @@ const Transaction = require('../model/transaction');
 const Category = require('../model/category');
 const { userAuth } = require('../middlewares/auth');
 const { default: mongoose, isValidObjectId } = require('mongoose');
+const { calculateRecurringDetails } = require('../utils/recurring');
 const transactionRouter = express.Router();
 // /api/transactions?category=food
 
@@ -129,6 +130,7 @@ transactionRouter.post('/transaction', userAuth, async (req, res) => {
 
       // ✅ If recurring and both dates are provided — generate immediately
       if (recurring && recurringStartDate && recurringEndDate) {
+        // ✅ Case 1: Generate all upfront
         const generatedDates = [];
         let next = new Date(recurringStartDate);
         const end = new Date(recurringEndDate);
@@ -162,13 +164,17 @@ transactionRouter.post('/transaction', userAuth, async (req, res) => {
             category,
             user: userId,
             spendingType,
-            recurring: false // These are one-time entries created in advance
+            recurring: true, // ✅ it's still part of recurring logic
+            recurringFrequency,
+            recurringStartDate,
+            recurringEndDate,
+            nextOccurrence: null // ✅ no cron follow-up needed
           }))
         );
 
         createdTransactions.push(...batch);
       } else {
-        // ✅ Regular single transaction (cron will handle recurring if needed)
+        // ✅ Case 2: Open-ended — let cron job handle it
         const transaction = await Transaction.create({
           amount,
           date,
@@ -181,7 +187,7 @@ transactionRouter.post('/transaction', userAuth, async (req, res) => {
           recurringFrequency,
           recurringStartDate,
           recurringEndDate,
-          nextOccurrence
+          nextOccurrence: recurring ? date : null
         });
 
         createdTransactions.push(transaction);
@@ -197,33 +203,27 @@ transactionRouter.post('/transaction', userAuth, async (req, res) => {
     return res.status(500).json({ message: error.message });
   }
 });
-transactionRouter.get('/transaction/income', userAuth, async (req, res) => {
+const getTransactions = async (req, res, type) => {
   try {
     const userId = req.user._id;
-    console.log('UserId:', userId);
-    if (!userId) {
-      return res.status(401).json({ message: 'Unauthorized' });
-    }
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
     const skip = (page - 1) * limit;
 
-    // 🔹 Filters
     const category = req.query.category;
-    const startDate = req.query.startDate; // YYYY-MM-DD
-    const endDate = req.query.endDate; // YYYY-MM-DD
-    const sortBy = req.query.sortBy || 'date'; // Default: sort by date
-    const sortOrder = req.query.order === 'asc' ? 1 : -1; // Default: newest first
+    const startDate = req.query.startDate;
+    const endDate = req.query.endDate;
+    const sortBy = req.query.sortBy || 'date';
+    const sortOrder = req.query.order === 'asc' ? 1 : -1;
 
-    let query = { user: userId, type: 'income' }; // Filter by income
+    const query = { user: userId, type };
 
-    // ✅ Filter by category
     if (category && mongoose.Types.ObjectId.isValid(category)) {
       query.category = new mongoose.Types.ObjectId(category);
     }
 
-    // ✅ Filter by date range
     if (startDate && endDate) {
       query.date = {
         $gte: new Date(startDate),
@@ -231,65 +231,48 @@ transactionRouter.get('/transaction/income', userAuth, async (req, res) => {
       };
     }
 
-    // ✅ Fetch income transactions
-    const transactions = await Transaction.find(query)
-      .populate('category', 'name') // Include category name
+    // Fetch all user's transactions of this type (used for recurring grouping)
+    const allUserTxns = await Transaction.find({
+      user: userId,
+      type
+    }).lean();
+
+    // Fetch paginated data only for display
+    const paginated = await Transaction.find(query)
+      .populate('category', 'name')
       .sort({ [sortBy]: sortOrder })
       .skip(skip)
-      .limit(limit);
+      .limit(limit)
+      .lean();
 
-    return res.status(200).json({ transactions, page, limit });
-  } catch (error) {
-    return res.status(500).json({ message: error.message });
-  }
-});
-
-transactionRouter.get('/transaction/expense', userAuth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    console.log('UserId:', userId);
-    if (!userId) {
-      return res.status(401).json({ message: 'Unauthorized' });
-    }
-
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-
-    // 🔹 Filters
-    const category = req.query.category;
-    const startDate = req.query.startDate; // YYYY-MM-DD
-    const endDate = req.query.endDate; // YYYY-MM-DD
-    const sortBy = req.query.sortBy || 'date'; // Default: sort by date
-    const sortOrder = req.query.order === 'asc' ? 1 : -1; // Default: newest first
-
-    let query = { user: userId, type: 'expense' }; // Filter by expense
-
-    // ✅ Filter by category
-    if (category && mongoose.Types.ObjectId.isValid(category)) {
-      query.category = new mongoose.Types.ObjectId(category);
-    }
-
-    // ✅ Filter by date range
-    if (startDate && endDate) {
-      query.date = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate)
+    // Enrich each with recurring info
+    const enrichedTransactions = paginated.map((tx) => {
+      const recurringDetails = calculateRecurringDetails(tx, allUserTxns);
+      return {
+        ...tx,
+        recurringDetails: recurringDetails || undefined
       };
-    }
+    });
 
-    // ✅ Fetch expense transactions
-    const transactions = await Transaction.find(query)
-      .populate('category', 'name') // Include category name
-      .sort({ [sortBy]: sortOrder })
-      .skip(skip)
-      .limit(limit);
-
-    return res.status(200).json({ transactions, page, limit });
+    return res.status(200).json({
+      transactions: enrichedTransactions,
+      page,
+      limit
+    });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
-});
+};
+
+// Income route
+transactionRouter.get('/transaction/income', userAuth, (req, res) =>
+  getTransactions(req, res, 'income')
+);
+
+// Expense route
+transactionRouter.get('/transaction/expense', userAuth, (req, res) =>
+  getTransactions(req, res, 'expense')
+);
 
 transactionRouter.put('/transaction/:id', userAuth, async (req, res) => {
   try {
@@ -677,7 +660,8 @@ transactionRouter.get(
 
       const recentIncome = await Transaction.find({
         user: userId,
-        type: 'income'
+        type: 'income',
+        $or: [{ recurring: { $ne: true } }, { date: { $lte: new Date() } }]
       })
         .populate('category', 'name')
         .sort({ date: -1 })
@@ -703,7 +687,8 @@ transactionRouter.get(
 
       const recentExpenses = await Transaction.find({
         user: userId,
-        type: 'expense'
+        type: 'expense',
+        $or: [{ recurring: { $ne: true } }, { date: { $lte: new Date() } }]
       })
         .populate('category', 'name')
         .sort({ date: -1 })
