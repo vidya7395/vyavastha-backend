@@ -22,11 +22,13 @@ const authRouter = require('./routes/auth');
 const budgetRouter = require('./routes/budget');
 const categoryRouter = require('./routes/category');
 const transactionRouter = require('./routes/transaction');
+const reportsRouter = require('./routes/reports');
 
 app.use('/api/auth', authRouter);
 app.use('/api', budgetRouter);
 app.use('/api', categoryRouter);
 app.use('/api', transactionRouter);
+app.use('/api', reportsRouter);
 
 connectDB()
   .then(() => {

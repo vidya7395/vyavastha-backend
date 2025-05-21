@@ -167,8 +167,12 @@ transactionRouter.post('/transaction', userAuth, async (req, res) => {
           recurringGroupId: recurringDoc._id
         }));
 
-        const inserted = await transaction.insertMany(batch);
-        createdTransactions.push(...inserted);
+        try {
+          const inserted = await transaction.insertMany(batch);
+          createdTransactions.push(...inserted);
+        } catch (insertErr) {
+          console.error('InsertMany failed:', insertErr);
+        }
       }
 
       // Step 3: Non-recurring
@@ -208,9 +212,13 @@ const getTransactions = async (req, res, type = null) => {
       user: userId
     };
 
+    let allTransactionFilter = {
+      user: userId
+    };
     // Optional type filter ('income' or 'expense')
     if (type) {
       filter.type = type.toLowerCase(); // normalize
+      allTransactionFilter.type = type.toLowerCase();
     }
 
     // Apply date filters
@@ -224,8 +232,18 @@ const getTransactions = async (req, res, type = null) => {
       .populate('category')
       .lean();
 
-    transactions = updateRecurringDetails(transactions);
+    let allTransactions = await Transaction.find(allTransactionFilter)
+      .sort({ date: -1 }) // latest first
+      .populate('recurringGroupId')
+      .populate('category')
+      .lean();
 
+    transactions = transactions.map((tx) => {
+      if (tx.recurring) {
+        tx.recurringDetails = calculateRecurringDetails(tx, allTransactions);
+      }
+      return tx;
+    });
     res.status(200).json({
       transactions,
       page: 1,
@@ -451,7 +469,8 @@ transactionRouter.get('/transaction/summary', userAuth, async (req, res) => {
 
     const needs = spendingBreakdown.find((b) => b._id === 'needs')?.total || 0;
     const wants = spendingBreakdown.find((b) => b._id === 'wants')?.total || 0;
-    const savings = balance > 0 ? balance : 0;
+    const savings =
+      spendingBreakdown.find((b) => b._id === 'savings')?.total || 0;
 
     const spendingMap = { needs, wants, savings };
 

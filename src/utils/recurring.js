@@ -1,4 +1,7 @@
 function calculateRecurringDetails(currentTx, allTxns) {
+  console.log('cuurentTx', currentTx);
+  console.log('allTxns', allTxns);
+
   if (!currentTx.recurring || !currentTx.recurringGroupId) return null;
 
   const today = new Date();
@@ -8,13 +11,16 @@ function calculateRecurringDetails(currentTx, allTxns) {
         currentTx.recurringGroupId.toString()
       : currentTx.recurringGroupId.toString();
 
-  // Filter all transactions from same recurring group
+  // Filter all transactions from same recurring group]
   const groupTxns = allTxns.filter((tx) => {
+    if (!tx.recurring || !tx.recurringGroupId) return false;
+
     const txGroupId =
       typeof tx.recurringGroupId === 'object'
         ? tx.recurringGroupId._id?.toString() || tx.recurringGroupId.toString()
-        : tx.recurringGroupId?.toString();
-    return tx.recurring && txGroupId === groupId;
+        : tx.recurringGroupId.toString();
+
+    return txGroupId === groupId;
   });
 
   const totalOccurrences = groupTxns.length;
@@ -68,6 +74,7 @@ function generateRecurringDates(startDateStr, endDateStr, frequency) {
 
   return result;
 }
+
 function updateRecurringDetails(transactions) {
   const today = new Date();
   const groups = {};
@@ -93,13 +100,20 @@ function updateRecurringDetails(transactions) {
       tx.recurringGroupId?._id?.toString() || tx.recurringGroupId?.toString();
     const groupTxns = groups[groupId];
 
-    const totalOccurrences = groupTxns.length;
-
-    // Find index of the current tx within the group (sorted)
-    const index = groupTxns.findIndex(
-      (t) => t._id.toString() === tx._id.toString()
+    const recurringGroup = tx.recurringGroupId;
+    const expectedDates = generateRecurringDates(
+      recurringGroup.recurringStartDate,
+      recurringGroup.recurringEndDate,
+      recurringGroup.recurringFrequency
     );
-    const completedOccurrences = index + 1;
+
+    const totalOccurrences = expectedDates.length;
+    const txDate = new Date(tx.date);
+
+    // Count how many expected dates are before or equal to this transaction's date
+    const completedOccurrences = expectedDates.filter(
+      (d) => d <= txDate
+    ).length;
     const remaining = totalOccurrences - completedOccurrences;
 
     tx.recurringDetails = {
