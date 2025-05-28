@@ -10,6 +10,7 @@ const {
 } = require('../utils/recurring');
 const recurringTransaction = require('../model/recurringTransaction');
 const transaction = require('../model/transaction');
+const { default: axios } = require('axios');
 const transactionRouter = express.Router();
 // /api/transactions?category=food
 
@@ -528,7 +529,53 @@ transactionRouter.get('/transaction/summary', userAuth, async (req, res) => {
       'savings'
     );
 
-    return res.status(200).json({
+    let aiInsight = null;
+
+    try {
+      const prompt = `
+User's monthly income: ₹${totalIncome}
+Total expense: ₹${totalExpense}
+Balance: ₹${balance}
+
+Spending breakdown:
+- Needs: ₹${needsAnalysis.actual} (${needsAnalysis.percentage}%)
+- Wants: ₹${wantsAnalysis.actual} (${wantsAnalysis.percentage}%)
+- Savings: ₹${savingsAnalysis.actual} (${savingsAnalysis.percentage}%)
+
+You are a helpful, witty financial coach.
+
+Give  actionable financial tip to reduce spending or improve savings. Use simple English.
+ Just give a friendly, realistic suggestion and also funny.
+ make it in a way that user likes to read it, not very big that user lose his interest, like important stuff only
+
+`;
+
+      const aiResponse = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          model: 'gpt-3.5-turbo',
+          messages: [
+            { role: 'system', content: 'You are a smart financial assistant.' },
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.7
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      aiInsight = aiResponse.data.choices[0].message.content.trim();
+    } catch (err) {
+      console.warn('⚠️ AI insight generation failed:', err.message);
+      // No need to block response — we fallback to normal data
+    }
+
+    // ✅ Final response: AI insight is optional
+    const responsePayload = {
       totalIncome,
       totalExpense,
       balance,
@@ -537,7 +584,13 @@ transactionRouter.get('/transaction/summary', userAuth, async (req, res) => {
         wants: wantsAnalysis,
         savings: savingsAnalysis
       }
-    });
+    };
+
+    if (aiInsight) {
+      responsePayload.aiInsight = aiInsight;
+    }
+
+    return res.status(200).json(responsePayload);
   } catch (error) {
     console.error('Summary API Error:', error);
     return res.status(500).json({ message: error.message });

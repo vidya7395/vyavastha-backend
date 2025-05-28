@@ -9,7 +9,7 @@ require('./utils/cronJob');
 
 app.use(
   cors({
-    origin: 'http://localhost:5173', // Allow frontend origin
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173', // Use environment variable for frontend URL
     credentials: true, // Allow cookies if needed
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE', // Explicitly allow PATCH,
     preflightContinue: false,
@@ -23,12 +23,14 @@ const budgetRouter = require('./routes/budget');
 const categoryRouter = require('./routes/category');
 const transactionRouter = require('./routes/transaction');
 const reportsRouter = require('./routes/reports');
+const aiSummaryRouter = require('./routes/aiSummary');
 
 app.use('/api/auth', authRouter);
 app.use('/api', budgetRouter);
 app.use('/api', categoryRouter);
 app.use('/api', transactionRouter);
 app.use('/api', reportsRouter);
+app.use('/api', aiSummaryRouter);
 
 connectDB()
   .then(() => {
