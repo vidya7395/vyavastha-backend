@@ -56,17 +56,24 @@ authRouter.post('/logout', async (req, res) => {
       .cookie('token', null, {
         expires: new Date(Date.now())
       })
-      .send('Logout successfully !!');
+      .json('Logout successfully !!');
   } catch (error) {
     res.send('ERROR:' + error.message);
   }
 });
-authRouter.get('/me', userAuth, async (req, res) => {
+authRouter.get('/userDetail', userAuth, async (req, res) => {
   try {
     const userId = req.user._id;
-    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
-    const user = await Users.findById(new mongoose.Types.ObjectId(userId));
-    return res.status(201).json({ user });
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const user = await Users.findById(userId).select('name emailId');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    return res.status(200).json({ user }); // user will only contain name and emailId
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
