@@ -58,11 +58,11 @@ const parseTransactionsFromText = async (req, res) => {
 You are a helpful financial assistant.Correct grammar and spelling mistakes in the user input text, then parse the transactions into structured JSON objects.
 
 Parse the following user-entered transactions into structured JSON objects. Each object should include:
-- title (string)
+- description (string) => if you can provide description from single line thAT WOULD BE MUCH GOOD, LIKE GENERIC NOT TOO LENGHTY
 - amount (number)
 - type ("income" or "expense")
-- category (e.g. "shopping", "salary", "recharge")
-- rule ("needs", "wants", or "savings") — follow the 50/30/20 rule.
+- categoryId (e.g. "shopping", "salary", "recharge")
+- spendingType ("needs", "wants", or "savings") — follow the 50/30/20 rule.
 
 Input:
 ${text}
@@ -70,11 +70,12 @@ ${text}
 Output a JSON array like:
 [
   {
-    "title": "clothes",
+    "description": "clothes",
     "amount": 120,
     "type": "expense",
-    "category": "shopping",
-    "rule": "wants"
+    "categoryId": "shopping",
+    "spendingType": "wants",
+    "date": new Date()
   }
 ]
 `;
