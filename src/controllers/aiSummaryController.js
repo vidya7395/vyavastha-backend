@@ -63,6 +63,7 @@ Parse the following user-entered transactions into structured JSON objects. Each
 - type ("income" or "expense")
 - categoryId (e.g. "shopping", "salary", "recharge")
 - spendingType ("needs", "wants", or "savings") — follow the 50/30/20 rule.
+- date (YYYY-MM-DD format, if available)
 
 Input:
 ${text}
@@ -75,7 +76,7 @@ Output a JSON array like:
     "type": "expense",
     "categoryId": "shopping",
     "spendingType": "wants",
-    "date": new Date()
+    "date": "2023-10-01"
   }
 ]
 `;
