@@ -1,23 +1,39 @@
 const mongoose = require('mongoose');
-const { Schema } = mongoose;
 
-// Define the schema for Transaction
-const TransactionSchema = new Schema({
+const TransactionSchema = new mongoose.Schema(
+  {
     user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     amount: { type: Number, required: true },
-    category: { type: mongoose.Schema.Types.ObjectId, ref: "Category", required: true },
+
+    recurringGroupId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'RecurringTransaction',
+      default: null
+    },
+
+    category: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Category',
+      required: true
+    },
     type: { type: String, enum: ['income', 'expense'], required: true },
-    spendingType: { 
-        type: String, 
-        enum: ["needs", "wants", "savings"], 
-        required: function () { return this.type === "expense"; } // Only required for expenses
-      },
+
+    spendingType: {
+      type: String,
+      enum: ['needs', 'wants', 'savings'],
+      required: function () {
+        return this.type === 'expense';
+      }
+    },
+
     description: { type: String },
-    date: { type: Date, default: Date.now }
-    
-}, { timestamps: true });
+    date: { type: Date, default: Date.now },
 
-// Create or retrieve the model
-const Transaction = mongoose.models.Transaction || mongoose.model('Transaction', TransactionSchema);
-
-module.exports = Transaction;
+    // Only these two recurring fields are needed
+    recurring: { type: Boolean, default: false },
+    nextOccurrence: { type: Date } // Optional: used for future views
+  },
+  { timestamps: true }
+);
+module.exports = mongoose.model('transaction', TransactionSchema);
+// module.exports = mongoose.model('Transaction', TransactionSchema);
