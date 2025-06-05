@@ -1,7 +1,4 @@
 function calculateRecurringDetails(currentTx, allTxns) {
-  console.log('cuurentTx', currentTx);
-  console.log('allTxns', allTxns);
-
   if (!currentTx.recurring || !currentTx.recurringGroupId) return null;
 
   const today = new Date();
