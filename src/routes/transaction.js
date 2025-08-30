@@ -3,6 +3,14 @@ const Transaction = require('../model/transaction');
 const Category = require('../model/category');
 const { userAuth } = require('../middlewares/auth');
 const { default: mongoose, isValidObjectId } = require('mongoose');
+const {
+  calculateRecurringDetails,
+  generateRecurringDates,
+  updateRecurringDetails
+} = require('../utils/recurring');
+const recurringTransaction = require('../model/recurringTransaction');
+const transaction = require('../model/transaction');
+const { default: axios } = require('axios');
 const transactionRouter = express.Router();
 // /api/transactions?category=food
 
@@ -57,14 +65,13 @@ transactionRouter.get('/transaction', userAuth, async (req, res) => {
 });
 
 // POST /api/transactions: Create a new transaction for the authenticated user
+
 transactionRouter.post('/transaction', userAuth, async (req, res) => {
   try {
-    // Retrieve the user ID from the header
     const userId = req.user._id;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const transactions = req.body; // Expecting an array of transactions
-
+    const transactions = req.body;
     if (!Array.isArray(transactions) || transactions.length === 0) {
       return res
         .status(400)
@@ -73,211 +80,305 @@ transactionRouter.post('/transaction', userAuth, async (req, res) => {
 
     const createdTransactions = [];
 
-    for (const transactionData of transactions) {
-      const { amount, date, description, categoryId, type, spendingType } =
-        transactionData;
-
-      if (!amount || !date || !categoryId || !type || !spendingType) {
-        return res
-          .status(400)
-          .json({ message: 'All fields are required for each transaction.' });
-      }
-
-      let category = null;
-
-      if (isValidObjectId(categoryId)) {
-        const existingCategory = await Category.findById(categoryId);
-        if (!existingCategory) {
-          return res
-            .status(400)
-            .json({ message: `Invalid category ID: ${categoryId}` });
-        }
-        category = categoryId;
-      } else {
-        let existingCategoryByName = await Category.findOne({
-          name: categoryId
-        });
-
-        if (!existingCategoryByName) {
-          const newCategory = new Category({ name: categoryId, user: userId });
-          existingCategoryByName = await newCategory.save();
-        }
-        category = existingCategoryByName._id; // Assign the found or newly created category's ID
-      }
-
-      // Create the transaction
-      const transaction = await Transaction.create({
+    for (const tx of transactions) {
+      const {
         amount,
         date,
         description,
+        categoryId,
         type,
-        category,
-        user: userId,
-        spendingType
-      });
+        spendingType,
+        recurring = false,
+        recurringFrequency,
+        recurringStartDate,
+        recurringEndDate
+      } = tx;
 
-      createdTransactions.push(transaction);
+      if (
+        !amount ||
+        !date ||
+        !categoryId ||
+        !type ||
+        (type === 'expense' && !spendingType)
+      ) {
+        return res.status(400).json({ message: 'Missing required fields.' });
+      }
+
+      // Step 1: Resolve category
+      let category = null;
+      if (isValidObjectId(categoryId)) {
+        const found = await Category.findById(categoryId);
+        if (!found)
+          return res.status(400).json({ message: 'Invalid category ID.' });
+        category = found._id;
+      } else {
+        let existing = await Category.findOne({ name: categoryId });
+        if (!existing) {
+          existing = await new Category({
+            name: categoryId,
+            user: userId
+          }).save();
+        }
+        category = existing._id;
+      }
+
+      // Step 2: Handle recurring logic
+      if (recurring) {
+        // 🔥 Step 2a: Create RecurringTransaction
+        const recurringDoc = await recurringTransaction.create({
+          user: userId,
+          amount,
+          description,
+          type,
+          spendingType,
+          category,
+          recurringFrequency,
+          recurringStartDate: new Date(recurringStartDate || date),
+          recurringEndDate: recurringEndDate
+            ? new Date(recurringEndDate)
+            : null,
+          lastGeneratedDate: null
+        });
+
+        // 🔁 Step 2b: Generate dates
+        let occurrences = [];
+        if (recurringEndDate) {
+          occurrences = generateRecurringDates(
+            recurringStartDate,
+            recurringEndDate,
+            recurringFrequency
+          );
+        } else {
+          occurrences = [new Date(recurringStartDate || date)];
+        }
+
+        // Step 2c: Save child transactions
+        const batch = occurrences.map((d, i) => ({
+          user: userId,
+          amount,
+          description,
+          type,
+          spendingType,
+          category,
+          date: new Date(d),
+          recurring: true,
+          nextOccurrence: occurrences[i + 1]
+            ? new Date(occurrences[i + 1])
+            : null,
+          recurringGroupId: recurringDoc._id
+        }));
+
+        try {
+          const inserted = await transaction.insertMany(batch);
+          createdTransactions.push(...inserted);
+        } catch (insertErr) {
+          console.error('InsertMany failed:', insertErr);
+        }
+      }
+
+      // Step 3: Non-recurring
+      else {
+        const transaction = await Transaction.create({
+          user: userId,
+          amount,
+          description,
+          type,
+          spendingType,
+          category,
+          date: new Date(date),
+          recurring: false
+        });
+        createdTransactions.push(transaction);
+      }
     }
 
     return res.status(201).json({
       transactions: createdTransactions,
       message: 'Transactions added!'
     });
-  } catch (error) {
-    console.error('error', error);
-    return res.status(500).json({ message: error.message });
+  } catch (err) {
+    console.error('Add transaction error:', err);
+    return res.status(500).json({ message: err.message });
   }
 });
-transactionRouter.get('/transaction/income', userAuth, async (req, res) => {
+const getTransactions = async (req, res, type = null) => {
   try {
-    const userId = req.user._id;
-    console.log('UserId:', userId);
-    if (!userId) {
-      return res.status(401).json({ message: 'Unauthorized' });
+    const userId = req.user.id;
+    const today = new Date();
+
+    const showFuture = req.query.future === 'true';
+    const showAll = req.query.all === 'true';
+
+    let filter = {
+      user: userId
+    };
+
+    let allTransactionFilter = {
+      user: userId
+    };
+    // Optional type filter ('income' or 'expense')
+    if (type) {
+      filter.type = type.toLowerCase(); // normalize
+      allTransactionFilter.type = type.toLowerCase();
     }
 
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-
-    // 🔹 Filters
-    const category = req.query.category;
-    const startDate = req.query.startDate; // YYYY-MM-DD
-    const endDate = req.query.endDate; // YYYY-MM-DD
-    const sortBy = req.query.sortBy || 'date'; // Default: sort by date
-    const sortOrder = req.query.order === 'asc' ? 1 : -1; // Default: newest first
-
-    let query = { user: userId, type: 'income' }; // Filter by income
-
-    // ✅ Filter by category
-    if (category && mongoose.Types.ObjectId.isValid(category)) {
-      query.category = new mongoose.Types.ObjectId(category);
+    // Apply date filters
+    if (!showAll) {
+      filter.date = showFuture ? { $gt: today } : { $lte: today };
     }
 
-    // ✅ Filter by date range
-    if (startDate && endDate) {
-      query.date = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate)
-      };
-    }
+    let transactions = await Transaction.find(filter)
+      .sort({ date: -1 }) // latest first
+      .populate('recurringGroupId')
+      .populate('category')
+      .lean();
 
-    // ✅ Fetch income transactions
-    const transactions = await Transaction.find(query)
-      .populate('category', 'name') // Include category name
-      .sort({ [sortBy]: sortOrder })
-      .skip(skip)
-      .limit(limit);
+    let allTransactions = await Transaction.find(allTransactionFilter)
+      .sort({ date: -1 }) // latest first
+      .populate('recurringGroupId')
+      .populate('category')
+      .lean();
 
-    return res.status(200).json({ transactions, page, limit });
-  } catch (error) {
-    return res.status(500).json({ message: error.message });
+    transactions = transactions.map((tx) => {
+      if (tx.recurring) {
+        tx.recurringDetails = calculateRecurringDetails(tx, allTransactions);
+      }
+      return tx;
+    });
+    res.status(200).json({
+      transactions,
+      page: 1,
+      limit: 10
+    });
+  } catch (err) {
+    console.error('Error fetching transactions:', err);
+    res
+      .status(500)
+      .json({ message: 'Something went wrong while fetching transactions.' });
   }
-});
+};
 
-transactionRouter.get('/transaction/expense', userAuth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    console.log('UserId:', userId);
-    if (!userId) {
-      return res.status(401).json({ message: 'Unauthorized' });
-    }
+// Income route
+transactionRouter.get('/transaction/income', userAuth, (req, res) =>
+  getTransactions(req, res, 'income')
+);
 
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-
-    // 🔹 Filters
-    const category = req.query.category;
-    const startDate = req.query.startDate; // YYYY-MM-DD
-    const endDate = req.query.endDate; // YYYY-MM-DD
-    const sortBy = req.query.sortBy || 'date'; // Default: sort by date
-    const sortOrder = req.query.order === 'asc' ? 1 : -1; // Default: newest first
-
-    let query = { user: userId, type: 'expense' }; // Filter by expense
-
-    // ✅ Filter by category
-    if (category && mongoose.Types.ObjectId.isValid(category)) {
-      query.category = new mongoose.Types.ObjectId(category);
-    }
-
-    // ✅ Filter by date range
-    if (startDate && endDate) {
-      query.date = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate)
-      };
-    }
-
-    // ✅ Fetch expense transactions
-    const transactions = await Transaction.find(query)
-      .populate('category', 'name') // Include category name
-      .sort({ [sortBy]: sortOrder })
-      .skip(skip)
-      .limit(limit);
-
-    return res.status(200).json({ transactions, page, limit });
-  } catch (error) {
-    return res.status(500).json({ message: error.message });
-  }
-});
+// Expense route
+transactionRouter.get('/transaction/expense', userAuth, (req, res) =>
+  getTransactions(req, res, 'expense')
+);
 
 transactionRouter.put('/transaction/:id', userAuth, async (req, res) => {
   try {
+    // ✅ Step 1: Authenticate user
     const userId = req.user._id;
-    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized access' });
+    }
 
+    // ✅ Step 2: Extract params & request body
     const transactionId = req.params.id;
-    const { amount, category, description, date, type } = req.body;
+    const {
+      amount,
+      category,
+      description,
+      date,
+      type,
+      spendingType,
+      recurring,
+      recurringFrequency,
+      recurringStartDate,
+      recurringEndDate,
+      nextOccurrence
+    } = req.body;
 
+    // ✅ Step 3: Basic validation for required fields
     if (!amount || !category || !date || !type) {
       return res.status(400).json({
-        message: 'All fields (amount, category, date, type) are required.'
+        message: 'Missing required fields: amount, category, date, or type.'
       });
     }
+
+    // ✅ Step 4: If recurring is true, ensure frequency is present
+    if (recurring === true && !recurringFrequency) {
+      return res.status(400).json({
+        message: 'Recurring frequency is required when recurring is enabled.'
+      });
+    }
+
+    // ✅ Step 5: Normalize/resolve category
     let categoryId = null;
     if (isValidObjectId(category)) {
       const existingCategory = await Category.findById(category);
       if (!existingCategory) {
         return res.status(400).json({ message: 'Invalid category ID.' });
       }
-      console.log('existingCategory', existingCategory);
-
       categoryId = category;
     } else {
       const existingCategoryByName = await Category.findOne({ name: category });
       if (!existingCategoryByName) {
         return res.status(400).json({
           message:
-            'Category not found. Please provide a valid category ID or name.'
+            'Category not found. Please provide a valid category ID or existing category name.'
         });
       }
-      console.log('existingCategoryByName', existingCategoryByName);
-
-      categoryId = existingCategoryByName._id; // Assign the found category's ID
+      categoryId = existingCategoryByName._id;
     }
 
-    // Find and update the transaction
+    // ✅ Step 6: Prepare fields to update
+    const updateFields = {
+      amount,
+      category: categoryId,
+      description,
+      date,
+      type,
+      spendingType,
+      recurring
+    };
+
+    // ✅ Step 7: Add/remove recurring-related fields
+    if (recurring === true) {
+      if (recurringFrequency)
+        updateFields.recurringFrequency = recurringFrequency;
+      if (recurringStartDate)
+        updateFields.recurringStartDate = recurringStartDate;
+      if (recurringEndDate) updateFields.recurringEndDate = recurringEndDate;
+      if (nextOccurrence) updateFields.nextOccurrence = nextOccurrence;
+    } else {
+      // Clear all recurring fields if not recurring
+      updateFields.recurringFrequency = null;
+      updateFields.recurringStartDate = null;
+      updateFields.recurringEndDate = null;
+      updateFields.nextOccurrence = null;
+    }
+
+    // ✅ Step 8: Update transaction in DB
     const updatedTransaction = await Transaction.findOneAndUpdate(
-      { _id: transactionId, user: userId }, // Ensure the transaction belongs to the user
-      { amount, category: categoryId, description, date, type },
+      { _id: transactionId, user: userId },
+      updateFields,
       { new: true }
     );
 
     if (!updatedTransaction) {
-      return res
-        .status(404)
-        .json({ message: 'Transaction not found or unauthorized!' });
+      return res.status(404).json({
+        message: 'Transaction not found or does not belong to the user.'
+      });
     }
 
+    // ✅ Step 9: Respond with success
     return res.status(200).json({
-      message: 'Transaction updated!',
+      message: 'Transaction updated successfully.',
       transaction: updatedTransaction
     });
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    console.error('Error updating transaction:', error);
+    return res.status(500).json({
+      message: 'Something went wrong while updating the transaction.',
+      error: error.message
+    });
   }
 });
+
 transactionRouter.delete('/transaction/:id', userAuth, async (req, res) => {
   try {
     const transactionId = req.params.id;
@@ -316,7 +417,7 @@ transactionRouter.get('/transaction/summary', userAuth, async (req, res) => {
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
-    // ✅ Get month from query params (e.g., "2024-03")
+
     const { month } = req.query;
     if (!month) {
       return res
@@ -325,9 +426,8 @@ transactionRouter.get('/transaction/summary', userAuth, async (req, res) => {
     }
 
     const startDate = new Date(`${month}-01`);
-    const endDate = new Date(`${month}-31`); // Covers the whole month
+    const endDate = new Date(`${month}-31`);
 
-    // 🔹 Aggregate total income & expense for the selected month
     const summary = await Transaction.aggregate([
       {
         $match: {
@@ -352,7 +452,6 @@ transactionRouter.get('/transaction/summary', userAuth, async (req, res) => {
     const totalExpense = summary[0]?.totalExpense || 0;
     const balance = totalIncome - totalExpense;
 
-    // 🔹 Aggregate Needs, Wants, and Savings Breakdown
     const spendingBreakdown = await Transaction.aggregate([
       {
         $match: {
@@ -369,83 +468,131 @@ transactionRouter.get('/transaction/summary', userAuth, async (req, res) => {
       }
     ]);
 
-    // Convert spending breakdown into a structured object
-    const needs =
-      spendingBreakdown.find((item) => item._id === 'needs')?.total || 0;
-    const wants =
-      spendingBreakdown.find((item) => item._id === 'wants')?.total || 0;
+    const needs = spendingBreakdown.find((b) => b._id === 'needs')?.total || 0;
+    const wants = spendingBreakdown.find((b) => b._id === 'wants')?.total || 0;
     const savings =
-      spendingBreakdown.find((item) => item._id === 'savings')?.total || 0;
+      spendingBreakdown.find((b) => b._id === 'savings')?.total || 0;
 
-    // 🔹 Calculate percentages
-    const needsPercentage = totalIncome ? (needs / totalIncome) * 100 : 0;
-    const wantsPercentage = totalIncome ? (wants / totalIncome) * 100 : 0;
-    const savingsPercentage = totalIncome ? (savings / totalIncome) * 100 : 0;
+    const spendingMap = { needs, wants, savings };
 
-    // 🔹 Warnings for Overspending
-    let warnings = [];
-    if (needsPercentage > 50)
-      warnings.push(
-        '⚠️ Needs spending is above 50% of income! Consider reducing fixed expenses.'
+    const analyze = (actualPercent, idealPercent, type) => {
+      const diff = actualPercent - idealPercent;
+      let status = 'ok';
+      let suggestion = '';
+      const actual = type === 'savings' ? savings : spendingMap[type] || 0;
+      const ideal = (totalIncome * idealPercent) / 100;
+
+      if (type === 'savings') {
+        if (actualPercent < 20) {
+          status = 'under';
+          suggestion = 'Try to save at least 20% of your income.';
+        } else if (actualPercent <= 30) {
+          status = 'great';
+          suggestion =
+            '👏 You’re doing well on savings. Keep building that buffer!';
+        } else {
+          status = 'excellent';
+          suggestion =
+            '🚀 Excellent savings rate! This gives you a lot of financial flexibility.';
+        }
+      } else {
+        if (actualPercent === 0) {
+          status = 'ok';
+          suggestion = `🎯 Perfect control on your ${type} spending.`;
+        } else if (actualPercent <= idealPercent) {
+          status = 'ok';
+          suggestion = `✅ Great job managing your ${type} spending!`;
+        } else if (actualPercent <= idealPercent + 10) {
+          status = 'caution';
+          suggestion = `⚠️ You’re slightly over your ${type} budget. Try trimming it.`;
+        } else {
+          status = 'over';
+          suggestion = `🚫 Overspending on ${type}. Time to review and cut back.`;
+        }
+      }
+
+      return {
+        status,
+        percentage: parseFloat(actualPercent.toFixed(2)),
+        actual: parseFloat(actual.toFixed(2)),
+        ideal: parseFloat(ideal.toFixed(2)),
+        difference: parseFloat(diff.toFixed(2)),
+        suggestion
+      };
+    };
+
+    const needsAnalysis = analyze((needs / totalIncome) * 100, 50, 'needs');
+    const wantsAnalysis = analyze((wants / totalIncome) * 100, 30, 'wants');
+    const savingsAnalysis = analyze(
+      (savings / totalIncome) * 100,
+      20,
+      'savings'
+    );
+
+    let aiInsight = null;
+
+    try {
+      const prompt = `
+User's monthly income: ₹${totalIncome}
+Total expense: ₹${totalExpense}
+Balance: ₹${balance}
+
+Spending breakdown:
+- Needs: ₹${needsAnalysis.actual} (${needsAnalysis.percentage}%)
+- Wants: ₹${wantsAnalysis.actual} (${wantsAnalysis.percentage}%)
+- Savings: ₹${savingsAnalysis.actual} (${savingsAnalysis.percentage}%)
+
+You are a helpful, witty financial coach.
+
+Give  actionable financial tip to reduce spending or improve savings. Use simple English.
+ Just give a friendly, realistic suggestion and also funny.
+ make it in a way that user likes to read it, not very big that user lose his interest, like important stuff only
+
+`;
+
+      const aiResponse = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          model: 'gpt-3.5-turbo',
+          messages: [
+            { role: 'system', content: 'You are a smart financial assistant.' },
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.7
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': 'application/json'
+          }
+        }
       );
-    if (wantsPercentage > 30)
-      warnings.push(
-        '⚠️ Wants spending exceeds 30%! You may be overspending on non-essentials.'
-      );
-    if (savingsPercentage < 20)
-      warnings.push(
-        '⚠️ Savings is below 20%! Consider increasing your savings.'
-      );
 
-    // 🔹 Aggregate category-wise expenses for the selected month
-    // const categoryBreakdown = await Transaction.aggregate([
-    //   {
-    //     $match: {
-    //       user: new mongoose.Types.ObjectId(userId),
-    //       type: "expense",
-    //       date: { $gte: startDate, $lte: endDate }
-    //     }
-    //   },
-    //   {
-    //     $group: {
-    //       _id: "$category",
-    //       total: { $sum: "$amount" },
-    //     },
-    //   },
-    //   {
-    //     $lookup: {
-    //       from: "categories",
-    //       localField: "_id",
-    //       foreignField: "_id",
-    //       as: "categoryDetails",
-    //     },
-    //   },
-    //   { $unwind: "$categoryDetails" },
-    //   {
-    //     $project: {
-    //       _id: 0,
-    //       categoryId: "$_id",
-    //       categoryName: "$categoryDetails.name",
-    //       total: 1,
-    //     },
-    //   },
-    //   { $sort: { total: -1 } },
-    // ]);
+      aiInsight = aiResponse.data.choices[0].message.content.trim();
+    } catch (err) {
+      console.warn('⚠️ AI insight generation failed:', err.message);
+      // No need to block response — we fallback to normal data
+    }
 
-    return res.status(200).json({
+    // ✅ Final response: AI insight is optional
+    const responsePayload = {
       totalIncome,
       totalExpense,
       balance,
-      needs,
-      wants,
-      savings,
-      needsPercentage,
-      wantsPercentage,
-      savingsPercentage,
-      warnings
-      // categoryBreakdown
-    });
+      breakdown: {
+        needs: needsAnalysis,
+        wants: wantsAnalysis,
+        savings: savingsAnalysis
+      }
+    };
+
+    if (aiInsight) {
+      responsePayload.aiInsight = aiInsight;
+    }
+
+    return res.status(200).json(responsePayload);
   } catch (error) {
+    console.error('Summary API Error:', error);
     return res.status(500).json({ message: error.message });
   }
 });
@@ -553,12 +700,13 @@ transactionRouter.get(
 
       const recentIncome = await Transaction.find({
         user: userId,
-        type: 'income'
+        type: 'income',
+        $or: [{ recurring: { $ne: true } }, { date: { $lte: new Date() } }]
       })
         .populate('category', 'name')
         .sort({ date: -1 })
         .limit(3)
-        .select('amount date description category type');
+        .select('amount date description category type recurring');
 
       return res.status(200).json({ recentIncome });
     } catch (error) {
@@ -579,12 +727,13 @@ transactionRouter.get(
 
       const recentExpenses = await Transaction.find({
         user: userId,
-        type: 'expense'
+        type: 'expense',
+        $or: [{ recurring: { $ne: true } }, { date: { $lte: new Date() } }]
       })
         .populate('category', 'name')
         .sort({ date: -1 })
         .limit(3)
-        .select('amount date description category type spendingType');
+        .select('amount date description category type spendingType recurring');
 
       return res.status(200).json({ recentExpenses });
     } catch (error) {
